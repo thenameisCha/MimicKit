@@ -148,6 +148,9 @@ class SimEnv(base_env.BaseEnv):
         if (eng_name == "isaac_gym"):
             import engines.isaac_gym_engine as isaac_gym_engine
             eng = isaac_gym_engine.IsaacGymEngine(engine_config, num_envs, device, visualize)
+        elif (eng_name == "isaac_lab"):
+            import engines.isaac_lab_engine as isaac_lab_engine
+            eng = isaac_lab_engine.IsaacLabEngine(engine_config, num_envs, device, visualize)
         else:
             assert False, print("Unsupported engine: {:s}".format(eng_name))
 

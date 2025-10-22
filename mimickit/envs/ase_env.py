@@ -24,3 +24,8 @@ class ASEEnv(amp_env.AMPEnv):
             char_env.CharEnv._reset_char(self, default_reset_ids)
 
         return
+
+class ASEEnvIGRIS(ASEEnv):
+    def __init__(self, config, num_envs, device, visualize):
+        super().__init__(config, num_envs, device, visualize)
+        return

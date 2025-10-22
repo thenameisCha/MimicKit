@@ -7,6 +7,7 @@ import learning.rl_util as rl_util
 import util.mp_util as mp_util
 import util.torch_util as torch_util
 import envs.base_env as base_env
+import learning.experience_buffer as experience_buffer
 
 import learning.distribution_gaussian_diag as distribution_gaussian_diag
 
@@ -351,3 +352,109 @@ class ASEAgent(amp_agent.AMPAgent):
         diversity_loss = torch.square(self._diversity_tar - diversity_ratio)
 
         return diversity_loss
+class ASEAgent_igris(ASEAgent):
+    def __init__(self, config, env, device, CaT_cfg=None):
+        super().__init__(config, env, device)
+        self.CaT_cfg = CaT_cfg
+        return
+
+    def _build_exp_buffer(self, config):
+        buffer_length = self._get_exp_buffer_length()
+        batch_size = self.get_num_envs()
+        self._exp_buffer = experience_buffer.ExperienceBuffer_custom(buffer_length=buffer_length, batch_size=batch_size,
+                                                              device=self._device)
+        if self.CaT_cfg is not None:
+            self._exp_buffer.init_CaT(self.CaT_cfg) 
+        obs_space = self._env.get_obs_space()
+        obs_dtype = torch_util.numpy_dtype_to_torch(obs_space.dtype)
+        obs_buffer = torch.zeros([buffer_length, batch_size] + list(obs_space.shape), device=self._device, dtype=obs_dtype)
+        self._exp_buffer.add_buffer("obs", obs_buffer)
+        
+        next_obs_buffer = torch.zeros_like(obs_buffer)
+        self._exp_buffer.add_buffer("next_obs", next_obs_buffer)
+
+        a_space = self._env.get_action_space()
+        a_dtype = torch_util.numpy_dtype_to_torch(a_space.dtype)
+        a_shape = list(a_space.shape)
+        if (a_shape == []):
+            a_shape = [1]
+
+        action_buffer = torch.zeros([buffer_length, batch_size] + a_shape, device=self._device, dtype=a_dtype)
+        self._exp_buffer.add_buffer("action", action_buffer)
+        
+        reward_buffer = torch.zeros([buffer_length, batch_size], device=self._device, dtype=torch.float)
+        self._exp_buffer.add_buffer("reward", reward_buffer)
+        
+        done_buffer = torch.zeros([buffer_length, batch_size], device=self._device, dtype=torch.int)
+        self._exp_buffer.add_buffer("done", done_buffer)
+
+        # TODO
+        # env must have get_CaT_size function
+        if self.CaT_cfg is not None:
+            CaT_size = len(self.CaT_cfg)
+            CaT_buffer = torch.zeros([buffer_length, batch_size] + CaT_size)
+            self._exp_buffer.add_buffer("CaT_c", CaT_buffer)
+
+        return
+
+    def _record_data_post_step(self, next_obs, r, done, next_info):
+        super()._record_data_post_step(next_obs, r, done, next_info)
+        # TODO
+        # Env must have get_CaT_values
+        # get_CaT_values will take in dict as input, select CaT_c from the dict object env.Cat_c, and output a concatentated tensor
+        # shape : (num_envs, num_constraints)
+        if self.CaT_cfg is not None:
+            self._exp_buffer.record("CaT_c", self._env.get_CaT_values(self.CaT_cfg))
+            self._exp_buffer.process_env_step_CaT(self._env.get_CaT_values())
+
+    def _build_train_data(self):
+        self.eval()
+        
+        self._record_disc_demo_data()
+        info = self._compute_rewards()
+
+        obs = self._exp_buffer.get_data("obs")
+        next_obs = self._exp_buffer.get_data("next_obs")
+        r = self._exp_buffer.get_data("reward")
+        done = self._exp_buffer.get_data("done")
+        latents = self._exp_buffer.get_data("latents")
+        rand_action_mask = self._exp_buffer.get_data("rand_action_mask")
+        if self.CaT_cfg is not None:
+            CaT_c = self._exp_buffer.get_data("CaT_c")
+            CaT_delta = self._exp_buffer.process_learning_step_CaT(self._iter, CaT_c)
+
+        norm_next_obs = self._obs_norm.normalize(next_obs)
+        next_critic_inputs = {"obs": norm_next_obs, "z": latents}
+        next_vals = torch_util.eval_minibatch(self._model.eval_critic, next_critic_inputs, self._critic_eval_batch_size)
+        next_vals = next_vals.squeeze(-1).detach()
+
+        succ_val = self._compute_succ_val()
+        succ_mask = (done == base_env.DoneFlags.SUCC.value)
+        next_vals[succ_mask] = succ_val
+
+        fail_val = self._compute_fail_val()
+        fail_mask = (done == base_env.DoneFlags.FAIL.value)
+        next_vals[fail_mask] = fail_val
+
+        new_vals = rl_util.compute_td_lambda_return_custom(r, next_vals, done, self._discount, self._td_lambda, CaT_delta)
+
+        norm_obs = self._obs_norm.normalize(obs)
+        critic_inputs = {"obs": norm_obs, "z": latents}
+        vals = torch_util.eval_minibatch(self._model.eval_critic, critic_inputs, self._critic_eval_batch_size)
+        vals = vals.squeeze(-1).detach()
+        adv = new_vals - vals
+        
+        rand_action_mask = (rand_action_mask == 1.0).flatten()
+        adv_flat = adv.flatten()
+        rand_action_adv = adv_flat[rand_action_mask]
+        adv_mean, adv_std = mp_util.calc_mean_std(rand_action_adv)
+        norm_adv = (adv - adv_mean) / torch.clamp_min(adv_std, 1e-5)
+        norm_adv = torch.clamp(norm_adv, -self._norm_adv_clip, self._norm_adv_clip)
+        
+        self._exp_buffer.set_data("tar_val", new_vals)
+        self._exp_buffer.set_data("adv", norm_adv)
+        
+        info["adv_mean"] = adv_mean
+        info["adv_std"] = adv_std
+
+        return info

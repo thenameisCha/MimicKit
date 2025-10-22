@@ -1,4 +1,5 @@
 import torch
+from collections import Counter
 
 class ExperienceBuffer():
     def __init__(self, buffer_length, batch_size, device):
@@ -113,3 +114,91 @@ class ExperienceBuffer():
         sample_count = self.get_sample_count()
         rand_idx = torch.remainder(rand_idx, sample_count)
         return rand_idx
+    
+class ExperienceBuffer_custom(ExperienceBuffer):
+    def __init__(self, buffer_length, batch_size, device):
+        super().__init__(buffer_length, batch_size, device)
+        self.CaT_cfg = None
+        self.CaT_cmax = None
+        self.CaT_prev_cmax = None
+        self.CaT_tau = 0.
+        self.CaT_pmax = 0.
+
+    def init_CaT(self, CaT_cfg:dict):
+            self.CaT_cfg = CaT_cfg
+            self.CaT_tau = CaT_cfg['decay_tau']
+            self.CaT_pmax = torch.zeros((len(CaT_cfg['constraints']),), device=self.device)
+
+            # Basic schedule sanity check
+            with torch.no_grad():
+                s_l, s_h = self.CaT_cfg["schedule"]
+                if s_h <= s_l:
+                    raise ValueError("schedule_h must be > schedule_l")
+
+            cons = list(self.CaT_cfg["constraints"].values())
+            ids  = [c["id"] for c in cons]
+
+            # ---- ID validation ----
+            # (1) type
+            if not all(isinstance(i, int) for i in ids):
+                bad = [i for i in ids if not isinstance(i, int)]
+                raise TypeError(f"All constraint ids must be integers; bad values: {bad}")
+
+            # (2) duplicates
+            dup_ids = [k for k, v in Counter(ids).items() if v > 1]
+            if dup_ids:
+                raise ValueError(f"Duplicate constraint id(s) found: {dup_ids}")
+
+            # (3) range (needed for scatter indexing)
+            n = len(cons)
+            out_of_range = [i for i in ids if i < 0 or i >= n]
+            if out_of_range:
+                raise ValueError(f"Constraint id(s) out of range [0, {n-1}]: {out_of_range}")
+
+
+            cons = list(self.CaT_cfg["constraints"].values())
+            self._cat_ids = torch.tensor([c["id"] for c in cons], device=self.device)
+            self._p_lo    = torch.tensor([c["p_max"][0] for c in cons], device=self.device)
+            self._p_hi    = torch.tensor([c["p_max"][1] for c in cons], device=self.device)
+
+            self.schedule_CaT()
+
+    def process_env_step_CaT(self, CaT):
+        if CaT is None:
+            return
+        if self.CaT_cmax is None: # initialize buffers
+            self.CaT_cmax = torch.zeros(CaT.shape[-1], device=self.device)
+            self.CaT_prev_cmax = torch.zeros_like(self.CaT_cmax)
+        self.CaT_cmax = torch.maximum(self.CaT_cmax, CaT.amax(dim=0))
+
+    def process_learning_step_CaT(self, it=0, CaT = None):
+        '''
+        Batch process CaT per learning step.
+        Computes CaT_delta used to scale rewards and values.
+        Returns CaT_delta
+        For scheduled CaT.
+        CaT starts at low p_max, reaches max p_max as training progresses
+        This function, given the traininig iteration, updates p_max.
+        '''
+        # Constraint as Termination
+        self.CaT_cmax = self.CaT_tau*self.CaT_cmax + (1-self.CaT_tau)*self.CaT_prev_cmax
+        CaT_delta = (self.CaT_pmax*torch.clip(CaT/(self.CaT_cmax+1.e-6), min=0., max=1.)).max(dim=-1, keepdim=True)[0]
+        assert CaT_delta.shape == self.rewards.shape, f'Shape mismatch, CaT_delta shape : {CaT_delta.shape}'
+        self.CaT_prev_cmax[:] = self.CaT_cmax[:]
+        if self.CaT_cfg is not None:
+            s_l, s_h = self.CaT_cfg["schedule"]
+            if s_h <= s_l:
+                raise ValueError("schedule_h must be > schedule_l")
+            # Progress alpha in [0,1]
+            it_t  = torch.as_tensor(it, dtype=self.CaT_pmax.dtype, device=self.CaT_pmax.device)
+            alpha = ((it_t - s_l) / float(s_h - s_l)).clamp_(0.0, 1.0)
+            # Interpolate per-constraint
+            vals = self._p_lo + alpha * (self._p_hi - self._p_lo)
+            # Write (indexing is simpler than scatter_ for 1-D)
+            self.CaT_pmax[self._cat_ids] = vals
+            print(f'CaT p max : {self.CaT_pmax}')
+        return CaT_delta
+
+    def reset(self):
+        super().reset()
+        self.CaT_cmax.zero_()
