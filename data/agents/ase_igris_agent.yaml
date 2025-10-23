@@ -1,7 +1,7 @@
 agent_name: "ASE"
 
 model:
-  actor_net: "gru_1layer_256units"
+  actor_net: "fc_2layers_128units"
   actor_init_output_scale: 0.01
   actor_std_type: "CONSTANT"
   action_std: 1.
